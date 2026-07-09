@@ -1,0 +1,222 @@
+import os
+import json
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, HttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from groq import AsyncGroq
+
+router = APIRouter()
+
+# axe-core CDN — loaded once per audit run via the page itself
+AXE_CORE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+
+AUDIT_SYSTEM_PROMPT = """You are an expert web accessibility auditor. You have been given the raw results 
+from an automated axe-core accessibility scan of a website. Your job is to produce a clear, 
+detailed, and actionable accessibility audit report in markdown.
+
+Structure your report exactly as follows:
+
+## Executive Summary
+Brief overview of the site's accessibility state, overall score impression, and critical risk.
+
+## Violation Summary
+
+| Severity | Count | Impact |
+|----------|-------|--------|
+| Critical | X | Must fix — blocks access for disabled users |
+| Serious  | X | Should fix — significantly impairs experience |
+| Moderate | X | Consider fixing — causes confusion |
+| Minor    | X | Low priority — minor inconvenience |
+
+## Detailed Findings
+
+For each violation, include:
+### [Severity] — [Violation Name]
+- **WCAG Criteria**: [relevant success criterion]
+- **Issue**: What is wrong and why it matters
+- **Affected Elements**: (list the specific elements/selectors)
+- **How to Fix**: Concrete code example or step-by-step guidance
+
+## Priority Fix Roadmap
+Numbered list of fixes in priority order (critical first), each with estimated effort (Low/Medium/High).
+
+## Overall Assessment
+One paragraph summary with a recommended next step."""
+
+
+def _format_violations_for_prompt(url: str, violations: list) -> str:
+    counts = {"critical": 0, "serious": 0, "moderate": 0, "minor": 0}
+    for v in violations:
+        impact = v.get("impact", "minor")
+        if impact in counts:
+            counts[impact] += 1
+
+    lines = [
+        f"**URL Audited:** {url}",
+        f"**Total Violations:** {len(violations)}",
+        f"**By Severity:** Critical={counts['critical']}, Serious={counts['serious']}, "
+        f"Moderate={counts['moderate']}, Minor={counts['minor']}",
+        "",
+        "---",
+        "",
+        "**RAW VIOLATIONS:**",
+        "",
+    ]
+
+    for i, v in enumerate(violations, 1):
+        nodes = v.get("nodes", [])
+        # Limit node snippets to keep prompt size reasonable
+        element_snippets = []
+        for node in nodes[:3]:
+            html = node.get("html", "")
+            if html:
+                element_snippets.append(f"  - `{html[:200]}`")
+        if len(nodes) > 3:
+            element_snippets.append(f"  - ...and {len(nodes) - 3} more elements")
+
+        lines.append(f"**{i}. [{v.get('impact', 'unknown').upper()}] {v.get('id', '')}**")
+        lines.append(f"- Description: {v.get('description', '')}")
+        lines.append(f"- Help: {v.get('help', '')}")
+        lines.append(f"- Help URL: {v.get('helpUrl', '')}")
+        lines.append(f"- Affected elements ({len(nodes)} total):")
+        lines.extend(element_snippets or ["  - (no element details)"])
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+class AuditRequest(BaseModel):
+    url: str
+
+
+class AuditResponse(BaseModel):
+    response: str
+    url: str
+    audit: list
+
+
+@router.post("/a11y/audit", response_model=AuditResponse)
+async def audit(request: AuditRequest):
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+
+    url = str(request.url).strip()
+
+    # --- Step 1: Run Playwright + axe-core scan ---
+    violations = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await context.new_page()
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # Give JS-heavy SPAs a moment to render
+                await page.wait_for_timeout(2000)
+            except PlaywrightTimeout:
+                await browser.close()
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Timed out loading {url}. The page may be too slow or blocking automated browsers.",
+                )
+            except Exception as nav_err:
+                await browser.close()
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Could not navigate to {url}: {str(nav_err)}",
+                )
+
+            # Inject axe-core from CDN into the page
+            try:
+                await page.add_script_tag(url=AXE_CORE_CDN)
+                await page.wait_for_timeout(500)
+            except Exception:
+                # Fallback: some pages block external scripts via CSP — try evaluate directly
+                pass
+
+            # Run axe
+            try:
+                axe_result = await page.evaluate("""
+                    async () => {
+                        if (typeof axe === 'undefined') {
+                            return { violations: [], error: 'axe-core could not be injected (CSP restriction)' };
+                        }
+                        const results = await axe.run(document, {
+                            runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'] }
+                        });
+                        return {
+                            violations: results.violations,
+                            passes: results.passes.length,
+                            incomplete: results.incomplete.length,
+                            inapplicable: results.inapplicable.length,
+                            error: null
+                        };
+                    }
+                """)
+            except Exception as axe_err:
+                await browser.close()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"axe-core execution failed: {str(axe_err)}",
+                )
+
+            await browser.close()
+
+            if axe_result.get("error"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=axe_result["error"],
+                )
+
+            violations = axe_result.get("violations", [])
+            passes_count = axe_result.get("passes", 0)
+            incomplete_count = axe_result.get("incomplete", 0)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audit failed: {str(e)}")
+
+    # --- Step 2: Build prompt and call Groq ---
+    if not violations:
+        no_violation_msg = (
+            f"## Accessibility Audit: {url}\n\n"
+            "**No violations detected!** axe-core found no WCAG A/AA issues on this page.\n\n"
+            f"- Passed checks: {passes_count}\n"
+            f"- Needs review: {incomplete_count}\n\n"
+            "> Note: Automated tools catch ~30–40% of accessibility issues. "
+            "Manual testing with a screen reader and keyboard is still recommended."
+        )
+        return AuditResponse(response=no_violation_msg, url=url, audit=[])
+
+    violation_text = _format_violations_for_prompt(url, violations)
+    user_prompt = (
+        f"Please generate a detailed accessibility audit report for the following scan results.\n\n"
+        f"{violation_text}"
+    )
+
+    client = AsyncGroq(api_key=api_key)
+    try:
+        completion = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": AUDIT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=4096,
+        )
+        report = completion.choices[0].message.content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM analysis failed: {str(e)}")
+
+    return AuditResponse(response=report, url=url, audit=violations)

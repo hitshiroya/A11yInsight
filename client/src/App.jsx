@@ -6,26 +6,27 @@ import LoadingMessage from './components/LoadingMessage'
 
 const A11Y_WELCOME = `# ♿ A11y Audit Agent
 
-I'm your **accessibility testing specialist**! I can run real accessibility audits using Cypress + axe-core.
+I'm your **accessibility specialist** — I can answer questions about web accessibility *and* run real automated audits on any live webpage.
 
-## How to run an accessibility audit:
+## Run a live audit:
+Share a URL and I'll scan it with axe-core + AI analysis:
+\`Audit https://example.com\`
+\`Check accessibility for https://github.com\`
 
-**Send me a message with a URL to test:**
-\`Test https://example.com for accessibility\`
+## What the audit checks:
+• **WCAG 2.1 A/AA compliance** — full axe-core scan
+• **Keyboard navigation** — tab order and focus management
+• **Screen reader compatibility** — ARIA and semantic HTML
+• **Color contrast** — text readability standards
+• **Forms & interactive components** — labels and structure
 
-## What I'll check:
-• **WCAG 2.1 compliance** - All levels (A, AA, AAA)
-• **Keyboard navigation** - Tab order and focus management
-• **Screen reader compatibility** - ARIA labels and semantic HTML
-• **Color contrast** - Text readability standards
-• **Form accessibility** - Labels, validation, and structure
+## Ask me anything:
+• \`What is WCAG 2.2 and what changed from 2.1?\`
+• \`How do I make a modal dialog accessible?\`
+• \`What ARIA role should a custom dropdown use?\`
+• \`Explain focus management best practices\`
 
-## Example commands:
-• \`Audit https://google.com\`
-• \`Check accessibility for https://github.com\`
-• \`Test a11y https://facebook.com\`
-
-**Ready to make the web more accessible!** 🌐✨`
+**Ready to make the web more accessible!**`
 
 function App() {
   const [messages, setMessages] = useState([
@@ -74,68 +75,75 @@ function App() {
       } else {
         const domainMatch = userMessage.match(/(?:www\.)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:\/[^\s]*)?/i)
         if (domainMatch) {
-          extractedUrl = `https://${domainMatch[0]}`
+          const candidate = `https://${domainMatch[0]}`
+          try {
+            new URL(candidate)
+            extractedUrl = candidate
+          } catch {
+            // not a valid URL — treat as plain question
+          }
         }
       }
 
-      if (!extractedUrl) {
-        setMessages(prev => [...prev, {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: `Please provide a valid URL so I can start the audit.`,
-          timestamp: Date.now(),
-          metadata: { tool: 'a11y-audit', requiresUrl: true }
-        }])
-        setIsLoading(false)
-        return
-      }
+      if (extractedUrl) {
+        // --- Audit mode: run axe scan + LLM analysis ---
+        const auditResponse = await fetch(`${apiUrl}/api/a11y/audit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: extractedUrl })
+        })
 
-      try {
-        new URL(extractedUrl)
-      } catch {
-        setMessages(prev => [...prev, {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: `Please try again with a properly formatted URL!`,
-          timestamp: Date.now(),
-          metadata: { tool: 'a11y-audit', error: true }
-        }])
-        setIsLoading(false)
-        return
-      }
-
-      const auditResponse = await fetch(`${apiUrl}/api/a11y/audit`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: extractedUrl })
-      })
-
-      if (!auditResponse.ok) {
-        throw new Error(`A11y audit failed: ${auditResponse.status}`)
-      }
-
-      const auditData = await auditResponse.json()
-
-      setMessages(prev => [...prev, {
-        id: Date.now() + 1,
-        type: 'ai',
-        content: auditData.response,
-        timestamp: Date.now(),
-        metadata: {
-          tool: 'a11y-audit',
-          url: auditData.url,
-          auditResults: auditData.audit,
-          llmAnalysis: true
+        if (!auditResponse.ok) {
+          const errData = await auditResponse.json().catch(() => ({}))
+          throw new Error(errData.detail || `Audit failed: ${auditResponse.status}`)
         }
-      }])
+
+        const auditData = await auditResponse.json()
+
+        setMessages(prev => [...prev, {
+          id: Date.now() + 1,
+          type: 'ai',
+          content: auditData.response,
+          timestamp: Date.now(),
+          metadata: {
+            tool: 'a11y-audit',
+            url: auditData.url,
+            auditResults: auditData.audit,
+            llmAnalysis: true
+          }
+        }])
+      } else {
+        // --- Chat mode: general a11y Q&A via LLM ---
+        const chatResponse = await fetch(`${apiUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userMessage })
+        })
+
+        if (!chatResponse.ok) {
+          const errData = await chatResponse.json().catch(() => ({}))
+          throw new Error(errData.detail || `Chat failed: ${chatResponse.status}`)
+        }
+
+        const chatData = await chatResponse.json()
+
+        setMessages(prev => [...prev, {
+          id: Date.now() + 1,
+          type: 'ai',
+          content: chatData.response,
+          timestamp: Date.now(),
+          metadata: { tool: 'a11y-chat' }
+        }])
+      }
+
       setIsLoading(false)
 
     } catch (error) {
-      console.error('A11y audit error:', error)
+      console.error('A11y error:', error)
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         type: 'ai',
-        content: `I'm having trouble connecting to the server. Please make sure the backend is running on port 5000. Error: ${error.message}`,
+        content: `Something went wrong: ${error.message}\n\nPlease make sure the backend is running on port 5000.`,
         timestamp: Date.now(),
         error: true
       }])
