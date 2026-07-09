@@ -1,14 +1,28 @@
 import os
-import json
+import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from groq import AsyncGroq
 
 router = APIRouter()
 
-# axe-core CDN — loaded once per audit run via the page itself
-AXE_CORE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+AXE_CORE_URL = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+
+# Fetched once on first audit, then cached for the lifetime of the server process
+_axe_source: str | None = None
+
+
+async def _get_axe_source() -> str:
+    """Download and cache axe-core source. Injected via page.evaluate() to bypass CSP."""
+    global _axe_source
+    if _axe_source is None:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(AXE_CORE_URL)
+            r.raise_for_status()
+            _axe_source = r.text
+    return _axe_source
+
 
 AUDIT_SYSTEM_PROMPT = """You are an expert web accessibility auditor. You have been given the raw results 
 from an automated axe-core accessibility scan of a website. Your job is to produce a clear, 
@@ -65,7 +79,6 @@ def _format_violations_for_prompt(url: str, violations: list) -> str:
 
     for i, v in enumerate(violations, 1):
         nodes = v.get("nodes", [])
-        # Limit node snippets to keep prompt size reasonable
         element_snippets = []
         for node in nodes[:3]:
             html = node.get("html", "")
@@ -103,13 +116,23 @@ async def audit(request: AuditRequest):
 
     url = str(request.url).strip()
 
-    # --- Step 1: Run Playwright + axe-core scan ---
+    # --- Step 1: Get axe-core source (cached after first fetch) ---
+    try:
+        axe_source = await _get_axe_source()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load axe-core: {str(e)}")
+
+    # --- Step 2: Run Playwright + axe-core scan ---
     violations = []
+    passes_count = 0
+    incomplete_count = 0
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
+                ignore_https_errors=True,
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -119,46 +142,64 @@ async def audit(request: AuditRequest):
             page = await context.new_page()
 
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                # Give JS-heavy SPAs a moment to render
-                await page.wait_for_timeout(2000)
+                # "commit" fires as soon as the HTTP response is received — least strict,
+                # works even on pages that block load/DOMContentLoaded events.
+                await page.goto(url, wait_until="commit", timeout=30000)
+                # Give JS-heavy SPAs time to render meaningful DOM
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
             except PlaywrightTimeout:
                 await browser.close()
                 raise HTTPException(
-                    status_code=422,
+                    status_code=400,
                     detail=f"Timed out loading {url}. The page may be too slow or blocking automated browsers.",
                 )
             except Exception as nav_err:
+                err_str = str(nav_err)
+                await browser.close()
+                if "ERR_NAME_NOT_RESOLVED" in err_str:
+                    detail = (
+                        f"Could not resolve the domain for `{url}`. "
+                        "Please check the URL — the hostname may not exist or may be misspelled. "
+                        "Try without the `www.` prefix (e.g. `https://example.com`)."
+                    )
+                elif "ERR_CONNECTION_REFUSED" in err_str:
+                    detail = f"Connection refused for `{url}`. The server may be down or the port may be incorrect."
+                elif "ERR_CONNECTION_TIMED_OUT" in err_str or "TIMEOUT" in err_str.upper():
+                    detail = f"Connection timed out loading `{url}`. The page may be too slow or blocking automated browsers."
+                else:
+                    detail = f"Could not navigate to `{url}`: {err_str}"
+                raise HTTPException(status_code=400, detail=detail)
+
+            # Inject axe-core source via page.evaluate() — this bypasses CSP because
+            # it runs in the devtools/browser context, not as a page-level <script> tag.
+            try:
+                await page.evaluate(axe_source)
+            except Exception as inject_err:
                 await browser.close()
                 raise HTTPException(
-                    status_code=422,
-                    detail=f"Could not navigate to {url}: {str(nav_err)}",
+                    status_code=500,
+                    detail=f"Failed to inject axe-core: {str(inject_err)}",
                 )
 
-            # Inject axe-core from CDN into the page
-            try:
-                await page.add_script_tag(url=AXE_CORE_CDN)
-                await page.wait_for_timeout(500)
-            except Exception:
-                # Fallback: some pages block external scripts via CSP — try evaluate directly
-                pass
-
-            # Run axe
+            # Run axe and collect results
             try:
                 axe_result = await page.evaluate("""
                     async () => {
-                        if (typeof axe === 'undefined') {
-                            return { violations: [], error: 'axe-core could not be injected (CSP restriction)' };
-                        }
                         const results = await axe.run(document, {
-                            runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'] }
+                            runOnly: {
+                                type: 'tag',
+                                values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice']
+                            }
                         });
                         return {
                             violations: results.violations,
                             passes: results.passes.length,
                             incomplete: results.incomplete.length,
-                            inapplicable: results.inapplicable.length,
-                            error: null
+                            inapplicable: results.inapplicable.length
                         };
                     }
                 """)
@@ -166,16 +207,10 @@ async def audit(request: AuditRequest):
                 await browser.close()
                 raise HTTPException(
                     status_code=500,
-                    detail=f"axe-core execution failed: {str(axe_err)}",
+                    detail=f"axe-core scan failed: {str(axe_err)}",
                 )
 
             await browser.close()
-
-            if axe_result.get("error"):
-                raise HTTPException(
-                    status_code=422,
-                    detail=axe_result["error"],
-                )
 
             violations = axe_result.get("violations", [])
             passes_count = axe_result.get("passes", 0)
@@ -184,17 +219,17 @@ async def audit(request: AuditRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audit failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Audit failed unexpectedly: {str(e)}")
 
-    # --- Step 2: Build prompt and call Groq ---
+    # --- Step 3: Build prompt and call Groq for the analysis report ---
     if not violations:
         no_violation_msg = (
             f"## Accessibility Audit: {url}\n\n"
             "**No violations detected!** axe-core found no WCAG A/AA issues on this page.\n\n"
             f"- Passed checks: {passes_count}\n"
-            f"- Needs review: {incomplete_count}\n\n"
+            f"- Needs manual review: {incomplete_count}\n\n"
             "> Note: Automated tools catch ~30–40% of accessibility issues. "
-            "Manual testing with a screen reader and keyboard is still recommended."
+            "Manual testing with a screen reader and keyboard navigation is still recommended."
         )
         return AuditResponse(response=no_violation_msg, url=url, audit=[])
 
